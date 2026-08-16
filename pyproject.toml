@@ -1,0 +1,64 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "smartdive"
+version = "3.0.0"
+description = "Physics-grounded swim start analysis from ordinary video"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "Daniil Strizhov" }]
+keywords = ["biomechanics", "pose-estimation", "sports-science", "swimming", "computer-vision"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+]
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.10",
+    "opencv-python>=4.8",
+    "matplotlib>=3.7",
+]
+
+[project.optional-dependencies]
+yolo = ["ultralytics>=8.3"]
+mediapipe = ["mediapipe>=0.10"]
+dev = [
+    "pytest>=7.4",
+    "pytest-cov>=4.1",
+    "ruff>=0.6",
+]
+all = ["smartdive[yolo,mediapipe,dev]"]
+
+[project.scripts]
+smartdive = "smartdive.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/strdaniil/smartdive3"
+Issues = "https://github.com/strdaniil/smartdive3/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/smartdive"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["B008"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["E501"]

@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Model weights (downloaded on first run)
+*.pt
+*.onnx
+
+# Data and generated output
+videos/
+output/
+runs/
+.cache/
+benchmarks/results/
+
+# Rendered demo videos are regenerable with benchmarks/make_demos.py, and are
+# far too large to keep in git. The README GIF and figures are committed.
+assets/*.mp4
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
