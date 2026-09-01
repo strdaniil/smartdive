@@ -41,8 +41,8 @@ all = ["smartdive[yolo,mediapipe,dev]"]
 smartdive = "smartdive.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/strdaniil/smartdive3"
-Issues = "https://github.com/strdaniil/smartdive3/issues"
+Homepage = "https://github.com/strdaniil/smartdive"
+Issues = "https://github.com/strdaniil/smartdive/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/smartdive"]

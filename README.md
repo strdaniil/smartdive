@@ -5,18 +5,18 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/strdaniil/smartdive3/actions/workflows/ci.yml"><img src="https://github.com/strdaniil/smartdive3/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/strdaniil/smartdive/actions/workflows/ci.yml"><img src="https://github.com/strdaniil/smartdive/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
   <a href="https://www.python.org/downloads/"><img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT"></a>
   <a href="https://github.com/astral-sh/ruff"><img src="https://img.shields.io/badge/code%20style-ruff-261230.svg" alt="Code style: ruff"></a>
 </p>
 
 <p align="center">
-  <img src="assets/ginz_dive_sidebyside.gif" width="88%" alt="old pipeline versus SmartDive 3">
+  <img src="assets/demo.gif" width="82%" alt="SmartDive tracking a racing start">
 </p>
 <p align="center">
-  <sub><b>Top:</b> the original pipeline, its trail tangled on the swimmers behind the blocks.
-  <b>Bottom:</b> SmartDive 3 tracking the diver through takeoff and flight.</sub>
+  <sub>SmartDive following the athlete's centre of mass through the airborne window,
+  from takeoff to water entry.</sub>
 </p>
 
 Point it at a clip of a racing start. It finds the athlete, subtracts the
@@ -26,7 +26,7 @@ flight time and flight distance in SI units, each with its calibration source
 and an uncertainty next to it.
 
 ```bash
-pip install "smartdive[yolo] @ git+https://github.com/strdaniil/smartdive3"
+pip install "smartdive[yolo] @ git+https://github.com/strdaniil/smartdive"
 smartdive analyze start.mp4 --overlay --stature-m 1.85
 ```
 
@@ -55,60 +55,26 @@ Fit quality                R^2 = 0.9893, RMS 11.0 px
 95% CI on takeoff angle: +23.4 to +27.6 deg
 ```
 
-## What it does differently
+## The model
 
-This is a rewrite of an earlier project of mine ([`smartdive`](https://github.com/strdaniil/smartdive),
-its `smartdive_v2` follow-up, and [diver-pro](https://www.diver-pro.net/)). Those
-versions ran pose estimation and drew a line on the video. The line looked
-convincing. The numbers underneath it were not.
-
-<p align="center">
-  <img src="assets/ginz_dive_comparison.png" width="88%" alt="tracked path, original versus SmartDive 3">
-</p>
-<p align="center">
-  <sub>The same clip, both trajectories. The original (left) never settles on the
-  diver; SmartDive 3 (right) follows one athlete from block to water.</sub>
-</p>
-
-The old code still printed a confident result on that clip: flight time 2.43 s,
-horizontal distance 75 px. That follows from four design decisions, each fixed
-here.
-
-**The subject is chosen once, not per frame.** The old code took
-`argmax(confidence)` in each frame with no association between frames, so the
-trajectory hopped to whoever was best lit. On the sample clips that was the
-diver in only 2% to 40% of frames. Now detections are associated into tracks,
-fragments of one person are stitched back together, and the athlete is chosen
-for the whole clip by peak speed in body lengths per second. Divers reach three
-to eight; someone walking the deck reaches one; someone on a block reaches none.
-
-**Flight time is measured, not the length of the clip.** The old code called
-flight the span between the first and last frame with any measurement, which for
-a person visible throughout is the whole video. Now takeoff and entry are each
-detected from their own cue: entry from the collapse in visible body mass when
-the athlete breaks the surface, takeoff from the per-frame fit residual climbing
-while a foot is still driving off the block.
-
-**The model is the physics.** The old code fit a degree-3 polynomial to the
-whole clip, whose coefficients mean nothing for a body in free flight. Now the
-model is the motion the body actually obeys, and its coefficients are the takeoff
-velocity:
+A body in free flight obeys, exactly:
 
 ```
 x(t) = x0 + vx*t
 y(t) = y0 + vy*t + 0.5*g*t^2        (image y grows downward)
 ```
 
-**Everything is in SI units.** The old output was "horizontal distance 431.2 px",
-which depends on where the camera stood and cannot be compared between clips.
-Everything is now in metres and seconds, and every report states which
-calibration produced it. The camera motion and the clock are measured too, not
-assumed; see [Camera and slow motion](#camera-and-slow-motion).
+SmartDive fits that model to the athlete's flight, so the coefficients it
+recovers *are* the takeoff velocity, the fit residual *is* the test of which
+frames were airborne, and every distance comes out in metres with a stated
+calibration and a bootstrap confidence interval. Nothing is reported in raw
+pixels, and nothing is reported without an error bar.
 
-## What the run produces
+## What a run produces
 
-Every analysis writes a JSON report, a per-frame CSV labelled `block` /
-`flight` / `water`, an optional annotated video, and this diagnostic figure:
+Each analysis writes a JSON report (metrics, the track ranking, signal quality,
+camera motion, provenance and warnings), a per-frame CSV labelled `block` /
+`flight` / `water`, an optional annotated video, and a diagnostic figure:
 
 <p align="center">
   <img src="assets/adive_diagnostics.png" width="92%" alt="diagnostic figure">
@@ -119,44 +85,30 @@ length mean the projectile model explains the motion and the metrics are sound;
 structure in them means it does not. The top-right panel shows the water-entry
 cue firing, and the bottom-right shows how much camera motion was removed.
 
-## Results on the original project's footage
+## Results across the sample clips
 
-Both pipelines run over the **same pose detections**, so nothing here turns on a
-better detector. `smartdive.legacy` re-implements the old code faithfully (same
-0.5 confidence gate, argmax subject rule, degree-3 fit, metric definitions), so
-the table is reproducible:
+Five starts filmed on ordinary phones, including two crowded pool decks and two
+clips shot in slow motion. Reproduce with:
 
 ```bash
 python benchmarks/run_benchmark.py videos/*.mp4 videos/*.mov --cache .cache
 ```
 
-| clip | | looking at the diver | path travelled | jitter | flight phase | result |
+| clip | frames | flight window | flight time | takeoff speed | distance | capture |
 |---|---|---|---|---|---|---|
-| **`adive.mp4`**<br><sub>48 frames</sub> | original | 14% of frames | 0.86 body lengths | 38.7 px | whole clip (0-47) | 1.57 s, 3 px |
-| | **SmartDive 3** | by construction | **2.98** body lengths | **8.8** px | frames 13-25 | 0.40 s, 4.4 m/s, 1.6 m |
-| **`adive_wide.mov`**<br><sub>138 frames</sub> | original | 40% of frames | 1.27 body lengths | 29.5 px | whole clip (0-137) | 4.57 s, 42 px |
-| | **SmartDive 3** | by construction | **3.57** body lengths | **4.4** px | frames 61-69 | 0.27 s, 5.0 m/s, 1.3 m |
-| **`adive2.mp4`**<br><sub>192 frames</sub> | original | 11% of frames | 0.83 body lengths | 19.6 px | whole clip (0-191) | 6.37 s, 3 px |
-| | **SmartDive 3** | by construction | **3.13** body lengths | **5.0** px | frames 47-103 | 0.47 s, 4.2 m/s, 1.7 m<br><sub>at 120 fps capture</sub> |
-| **`ginz_dive.mp4`**<br><sub>74 frames</sub> | original | 2% of frames | 2.05 body lengths | 143.6 px | whole clip (0-73) | 2.43 s, 75 px |
-| | **SmartDive 3** | by construction | **3.26** body lengths | **9.9** px | frames 32-49 | 0.57 s, 4.3 m/s, 2.3 m |
-| **`test1.mp4`**<br><sub>105 frames</sub> | original | 36% of frames | 2.14 body lengths | 107.6 px | whole clip (0-104) | 4.08 s, 513 px |
-| | **SmartDive 3** | by construction | **1.72** body lengths | **3.5** px | frames 36-97 | 0.51 s, 3.9 m/s, 1.9 m<br><sub>at 120 fps capture</sub> |
+| `adive.mp4` | 48 | 13-25 | 0.40 s | 4.4 m/s | 1.6 m | 30 fps |
+| `adive_wide.mov` | 138 | 61-69 | 0.27 s | 5.0 m/s | 1.3 m | 30 fps |
+| `adive2.mp4` | 192 | 47-103 | 0.47 s | 4.2 m/s | 1.7 m | 120 fps recovered |
+| `ginz_dive.mp4` | 74 | 32-49 | 0.57 s | 4.3 m/s | 2.3 m | 30 fps |
+| `test1.mp4` | 105 | 36-97 | 0.51 s | 3.9 m/s | 1.9 m | 120 fps recovered |
 
-Path travelled exposes the subject failure: on `adive.mp4` the original covers
-0.86 body lengths where the diver covers 2.98, and it reports the dive as 3 px
-long. On `ginz_dive.mp4` the original's path (2.05) looks respectable, but its
-jitter is 144 px, more than half a body length per frame, so that displacement
-is the trajectory ricocheting between people rather than travel. The jitter
-column is what tells them apart.
+### How accurate is it?
 
-### Is any of it right?
-
-There is no tape measure in this footage, so no ground truth. But two of the
-sample clips are the *same dive*: `adive.mp4` in real time and `adive2.mp4`
-exported at four times slow motion. Every disagreement between them is the
-pipeline's own error, and getting them to agree requires the slow-motion
-detection to recover 120 fps from a container insisting on 30.
+There is no tape measure in this footage, so there is no ground truth. But two of
+the clips are the *same dive*: `adive.mp4` in real time and `adive2.mp4` exported
+at four times slow motion. Any disagreement between them is the tool's own error,
+and reaching agreement at all requires the slow-motion detection to recover
+120 fps from a container insisting on 30.
 
 | quantity | `adive.mp4` | `adive2.mp4` | agreement |
 |---|---|---|---|
@@ -171,17 +123,16 @@ timings are quoted with error bars.
 
 ## Camera and slow motion
 
-Two assumptions that every earlier version made silently, and that phone footage
-routinely breaks.
+Two things phone footage does that break a naive analysis, both handled
+automatically.
 
 **The camera is not bolted down.** Whoever is filming pans to keep the athlete in
 shot, starting the pan the moment the athlete leaves the block, which puts a
 camera acceleration inside the flight window where the fit cannot separate it
-from the athlete's own motion. On the sample clips the background drifts 40 to
-260 px. So the camera is measured and subtracted: sparse features are tracked
-between frames, everything inside a detected person's box is discarded, and a
-similarity transform is fitted by RANSAC to what is left. Composing those warps
-gives a synthetic locked-off tripod.
+from the athlete's own motion. So the camera is measured and subtracted: sparse
+features are tracked between frames, everything inside a detected person's box is
+discarded, and a similarity transform is fitted by RANSAC to what is left.
+Composing those warps gives a synthetic locked-off tripod.
 
 **The container frame rate is not the capture rate.** A clip shot in a phone's
 slow-motion mode carries the rate it will be played at, so times and speeds come
@@ -197,8 +148,8 @@ itself slow motion.
 ## Install
 
 ```bash
-git clone https://github.com/strdaniil/smartdive3
-cd smartdive3
+git clone https://github.com/strdaniil/smartdive
+cd smartdive
 python -m venv .venv && source .venv/bin/activate    # Windows: .venv\Scripts\activate
 pip install -e ".[yolo]"
 ```
@@ -266,25 +217,31 @@ for warning in result.warnings:
 
 A few details worth calling out; [`docs/method.md`](docs/method.md) has the rest.
 
-**The detector gets a second look.** A whole-frame pass spends its resolution on
-the whole frame, and the part that needs it most, a motion-blurred body over the
-water, is where it fails. On `ginz_dive.mp4` the first pass stops reporting the
-diver ten frames before entry. So once the athlete is identified, the video is
-read again at a crop that follows them, upscaled to fill the network's input.
+**The subject is chosen once per clip, by peak speed in body lengths per second.**
+Detections are associated into tracks, fragments of one person are stitched back
+together, and the athlete is the one who briefly moves fastest relative to their
+own size. Divers reach three to eight body lengths per second at takeoff; someone
+walking the deck reaches one; someone standing on a block reaches none. That is
+what lets it pick the diver out of a busy pool deck.
 
-**Keypoints are conditioned before the centre of mass, not after.** The CoM is a
-weighted sum over body segments; if a segment drops out of a frame the sum runs
-over a different set of segments and moves even when the athlete does not.
-Conditioning each of the 17 keypoints as its own series first, filling a missing
-one from its contralateral partner, keeps the same segments contributing in
-every frame.
+**The detector gets a second look at a crop that follows the athlete.** A
+whole-frame pass spends its resolution on the whole frame, and the part that
+needs it most, a motion-blurred body over the water, is where it fails. Once the
+athlete is identified, the video is read again at a crop that follows them,
+upscaled to fill the network's input, so the frames near water entry are actually
+resolved.
 
-**The scale comes from bone lengths, not bounding boxes.** A bounding box is
-pose-dependent by a factor of three between a crouch and a streamline.
-Individual segments are fixed fractions of stature whatever the athlete is
-doing, and projection can only shorten them, so a high percentile of each
-segment's observed length estimates its true length. See
-[Calibration](#calibration) below.
+**Keypoints are conditioned before the centre of mass.** The CoM is a weighted
+sum over body segments; if a segment drops out of a frame the sum runs over a
+different set of segments and moves even when the athlete does not. Conditioning
+each of the 17 keypoints as its own series first, filling a missing one from its
+contralateral partner, keeps the same segments contributing in every frame.
+
+**The scale comes from bone lengths, not the bounding box.** A bounding box is
+pose-dependent by a factor of three between a crouch and a streamline. Individual
+segments are fixed fractions of stature whatever the athlete is doing, and
+projection can only shorten them, so a high percentile of each segment's observed
+length estimates its true length. See [Calibration](#calibration) below.
 
 ## Calibration
 
@@ -390,8 +347,8 @@ than one that has none.
   start are a lower bound and the report says so.
 - **Single start per clip.** Trim first if the video contains several. Several
   *swimmers* in one clip are fine; that is the whole point.
-- **The knee-angle band (125-150 deg)** is inherited from the original project's
-  heuristic, kept for continuity. It is not clinical advice.
+- **The knee-angle band (125-150 deg)** is a general set-position heuristic, not
+  clinical advice.
 
 For the best numbers: film square-on to the lane from a fixed position, in slow
 motion if the phone offers it, and pass `--stature-m`.
@@ -402,13 +359,13 @@ motion if the phone offers it, and pass `--stature-m`.
 src/smartdive/        the package; one module per pipeline stage (table above)
 tests/                pytest suite, backend stubbed (no weights, no footage)
   synthetic.py        the proportioned synthetic athlete the stubs are built on
-benchmarks/           old-vs-new comparison and demo rendering; needs footage
+benchmarks/           reproduce the results table and render demos; needs footage
   run_benchmark.py    the results table, reproducibly
-  make_demos.py       the side-by-side videos and the GIF
+  make_demos.py       the overlay videos and the demo GIF
 examples/quickstart.py  one clip, everything the pipeline knows about it
 docs/method.md        why each stage is built the way it is
 videos/               your clips (gitignored)
-assets/               committed figures and the README GIF
+assets/               committed figures and the demo GIF
 ```
 
 ## Development
