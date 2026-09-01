@@ -1,4 +1,13 @@
-"""Whole-body centre of mass from 2-D keypoints.
+"""Whole-body centre of mass from 2-D keypoints, one frame at a time.
+
+.. note::
+   Superseded by :mod:`smartdive.pose`, which conditions all 17 keypoints
+   *before* summing the segment masses. Computing the centre of mass frame by
+   frame, as here, takes the sum over a different set of segments whenever a
+   limb drops out, which moves the estimate even when the athlete has not
+   moved. This module is kept because it is what the comparison against the
+   original pipeline runs, and because a single-frame centre of mass is still
+   the right thing for a caller that has one frame.
 
 Tracking a single joint (the old pipeline tracked the hip midpoint) couples the
 measured trajectory to body *rotation*: a diver who pikes or extends in flight

@@ -1,4 +1,4 @@
-"""Trajectory conditioning: reject, fill, smooth -- without inventing motion."""
+"""Trajectory conditioning: reject, fill, smooth, without inventing motion."""
 
 from __future__ import annotations
 

@@ -179,7 +179,11 @@ class TestFlightDetection:
 
         assert phase is not None
         assert phase.takeoff_frame == pytest.approx(takeoff, abs=2)
-        assert phase.entry_frame == pytest.approx(entry, abs=2)
+        # Entry is only ever good to a few frames. The cue that finds it fires
+        # when the detector stops resolving the athlete's legs, and the first
+        # instants underwater are still very nearly ballistic, so a fit has
+        # nothing to object to for a frame or two past the surface.
+        assert phase.entry_frame == pytest.approx(entry, abs=4)
 
     def test_does_not_reach_back_into_the_block_phase(self):
         """The failure mode that flattens the parabola and ruins every metric."""

@@ -13,14 +13,20 @@ from smartdive.report import plot_diagnostics, write_csv, write_json
 
 
 def main(video: str) -> int:
-    # Caching the detections makes re-running this on the same clip instant,
-    # which matters because inference dominates the runtime.
-    config = AnalysisConfig(landmark="hips", bootstrap=400)
+    # Caching memoises the pose detections, the camera-motion estimate and the
+    # refinement pass, which makes re-running this on the same clip instant.
+    # Inference dominates the runtime and none of it depends on the analysis.
+    config = AnalysisConfig(bootstrap=400)
     result = analyze(video, config, cache=".cache")
 
+    rate = f"{result.video.fps:g} fps"
+    if result.time_base.corrected:
+        # The container frame rate was lying: this is slow-motion footage and
+        # every time and speed would otherwise be wrong by the same factor.
+        rate += f" container / {result.fps:g} fps capture"
     print(
         f"{result.video.path.name}: {result.video.frame_count} frames "
-        f"@ {result.video.fps:g} fps, analysed in {result.elapsed_s:.1f} s"
+        f"@ {rate}, analysed in {result.elapsed_s:.1f} s"
     )
 
     # Which person did it decide to measure, and why?
@@ -28,7 +34,8 @@ def main(video: str) -> int:
     for score in result.subject_ranking[:3]:
         print(
             f"  track {score.track_id:2d}  "
-            f"{score.displacement_bodies:5.2f} body lengths  "
+            f"{score.peak_speed_bodies_s:5.2f} body lengths/s peak  "
+            f"{score.displacement_bodies:5.2f} travelled  "
             f"{score.n_observations:3d} detections  "
             f"confidence {score.mean_score:.2f}"
         )
@@ -39,11 +46,22 @@ def main(video: str) -> int:
         f"\ncoverage {quality['coverage']:.0%}, "
         f"jitter {quality['jitter_raw_px']:.1f} -> "
         f"{quality['jitter_conditioned_px']:.1f} px, "
-        f"{int(quality['subject_switches'])} identity errors"
+        f"{int(quality['subject_switches'])} identity errors, "
+        f"{quality['camera_drift_px']:.0f} px of camera motion removed"
+    )
+    if result.refinement is not None:
+        print(
+            f"second detection pass: {result.refinement.frames_recovered} frames "
+            f"recovered, {result.refinement.frames_improved} improved"
+        )
+    print(
+        f"scale: {result.body.stature_px:.0f} px of stature from "
+        f"{len(result.body.per_segment)} body segments "
+        f"(spread {result.body.dispersion:.0%})"
     )
 
     if result.metrics is None:
-        print("\nno flight phase found -- try --flight-window, or a longer clip")
+        print("\nno flight phase found, try --flight-window, or a longer clip")
     else:
         print()
         print(result.metrics.format_table())

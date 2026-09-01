@@ -76,6 +76,21 @@ SKELETON: tuple[tuple[int, int], ...] = (
     (RIGHT_EAR, RIGHT_SHOULDER),
 )
 
+#: Left/right keypoint pairs. In a lateral view, how a racing start is almost
+#: always filmed, the two members of each pair project to nearly the same
+#: point, which is what makes contralateral substitution a safe way to complete
+#: a half-detected skeleton. See :func:`smartdive.pose.mirror_missing`.
+MIRROR: tuple[tuple[int, int], ...] = (
+    (LEFT_EYE, RIGHT_EYE),
+    (LEFT_EAR, RIGHT_EAR),
+    (LEFT_SHOULDER, RIGHT_SHOULDER),
+    (LEFT_ELBOW, RIGHT_ELBOW),
+    (LEFT_WRIST, RIGHT_WRIST),
+    (LEFT_HIP, RIGHT_HIP),
+    (LEFT_KNEE, RIGHT_KNEE),
+    (LEFT_ANKLE, RIGHT_ANKLE),
+)
+
 #: Midpoint landmarks, resolved as the mean of two keypoints.
 PAIR_LANDMARKS: dict[str, tuple[int, int]] = {
     "hips": (LEFT_HIP, RIGHT_HIP),

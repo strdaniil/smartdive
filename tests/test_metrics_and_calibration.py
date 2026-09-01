@@ -5,6 +5,7 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+from smartdive import anthro
 from smartdive import calibration as calib
 from smartdive.com import center_of_mass, visible_mass_fraction
 from smartdive.keypoints import (
@@ -116,6 +117,16 @@ class TestLandmarks:
         assert body_scale(xy, conf) == pytest.approx(200.0, rel=0.05)
 
 
+def _body(stature_px: float) -> anthro.BodySize:
+    """A minimal :class:`BodySize` standing in for a real measurement."""
+    return anthro.BodySize(
+        stature_px=stature_px,
+        per_segment={"trunk": stature_px, "left_leg": stature_px},
+        dispersion=0.02,
+        n_frames=10,
+    )
+
+
 class TestCalibration:
     def test_gravity_calibration_inverts_the_fit(self):
         frames, xy = synthetic_flight(px_per_m=180.0)
@@ -137,38 +148,104 @@ class TestCalibration:
     def test_resolve_prefers_a_reference_over_everything(self):
         frames, xy = synthetic_flight(px_per_m=180.0)
         fit = fit_ballistic(frames, xy, FPS)
-        c, notes = calib.resolve(fit, 300.0, reference_px=500.0, reference_m=2.5)
+        c, _ = calib.resolve(_body(300.0), reference_px=500.0, reference_m=2.5, fit=fit)
         assert c.method == "reference"
-        assert not notes
+        assert c.px_per_metre == pytest.approx(200.0)
 
-    def test_resolve_accepts_gravity_when_it_corroborates_the_prior(self):
+    def test_resolve_notes_a_gravity_cross_check_that_agrees(self):
         frames, xy = synthetic_flight(px_per_m=180.0)
         fit = fit_ballistic(frames, xy, FPS)
-        extended = 180.0 * 1.75 * calib.EXTENDED_BODY_RATIO  # a 1.75 m athlete
 
-        c, notes = calib.resolve(fit, extended)
+        c, notes = calib.resolve(_body(180.0 * 1.78), fit=fit)
 
-        assert c.method == "gravity"
+        # The body scale is the reported scale; gravity is only ever a check.
+        assert c.method == "stature_assumed"
         assert c.px_per_metre == pytest.approx(180.0, rel=1e-3)
-        assert not notes
+        assert notes and "within" in notes[0]
 
-    def test_resolve_falls_back_and_explains_when_gravity_disagrees(self):
+    def test_resolve_explains_when_the_gravity_cross_check_disagrees(self):
         frames, xy = synthetic_flight(px_per_m=180.0)
         fit = fit_ballistic(frames, xy, FPS)
-        # Body scale implies a wildly different scene scale.
-        c, notes = calib.resolve(fit, 2000.0)
+        # A body scale implying a wildly different scene scale.
+        c, notes = calib.resolve(_body(2000.0), fit=fit)
 
         assert c.method == "stature_assumed"
         assert notes and "disagrees" in notes[0]
 
-    def test_resolve_without_a_fit_uses_the_body_scale_prior(self):
-        c, _ = calib.resolve(None, 350.0, stature_m=1.80)
+    def test_resolve_without_a_fit_uses_the_body_scale(self):
+        c, notes = calib.resolve(_body(350.0), stature_m=1.80)
         assert c.method == "stature"
-        assert c.px_per_metre == pytest.approx(350.0 / (1.80 * calib.EXTENDED_BODY_RATIO))
+        assert c.px_per_metre == pytest.approx(350.0 / 1.80)
+        assert not notes
+
+    def test_a_varying_scale_is_read_per_frame(self):
+        """Oblique footage: the athlete shrinks as they fly away from the camera."""
+        relative = np.linspace(1.0, 0.8, 20)
+        c, _ = calib.resolve(_body(360.0), stature_m=1.80, relative_size=relative)
+
+        assert c.varies
+        assert c.at(0) == pytest.approx(200.0)
+        assert c.at(19) == pytest.approx(160.0)
+        assert c.depth_change() == pytest.approx(0.25, rel=1e-3)
+
+    def test_a_supplied_stature_is_used_verbatim(self):
+        c, _ = calib.resolve(_body(370.0), stature_m=1.85)
+        assert c.method == "stature"
+        assert c.stature_m == pytest.approx(1.85)
+        assert c.px_per_metre == pytest.approx(370.0 / 1.85)
+
+    def test_no_stature_falls_back_to_the_documented_default(self):
+        c, _ = calib.resolve(_body(370.0))
+        assert c.method == "stature_assumed"
+        assert c.stature_m == pytest.approx(anthro.DEFAULT_STATURE_M)
+        assert c.px_per_metre == pytest.approx(370.0 / anthro.DEFAULT_STATURE_M)
 
     def test_plausibility_flags_a_nonsense_scale(self):
         ok, _ = calib.plausibility(calib.Calibration(1000.0, "reference"), 350.0)
         assert not ok
+
+
+class TestTimeBase:
+    """Recovering the capture rate of slow-motion footage from gravity."""
+
+    @staticmethod
+    def _fit(px_per_m: float, factor: float, n: int = 40):
+        """A flight sampled as if the clip plays back ``1 / factor`` times slow."""
+        frames, xy = synthetic_flight(n=n, px_per_m=px_per_m)
+        t = frames / FPS
+        stretched = np.arange(n) / FPS
+        # Re-sample the same motion against a stretched clock.
+        return fit_ballistic(
+            np.arange(n),
+            np.stack(
+                [
+                    np.interp(stretched * factor, t, xy[:, 0]),
+                    np.interp(stretched * factor, t, xy[:, 1]),
+                ],
+                axis=1,
+            ),
+            FPS,
+        )
+
+    def test_real_time_footage_is_left_alone(self):
+        base, notes = calib.resolve_time_base(FPS, self._fit(180.0, 1.0), 180.0, n_points=40)
+        assert not base.corrected
+        assert base.effective_fps == pytest.approx(FPS)
+        assert not notes
+
+    def test_four_times_slow_motion_is_recovered(self):
+        base, notes = calib.resolve_time_base(FPS, self._fit(180.0, 0.25), 180.0, n_points=40)
+        assert base.corrected
+        assert base.effective_fps == pytest.approx(FPS * 4, rel=0.05)
+        assert notes and "slow motion" in notes[0]
+
+    def test_a_poorly_determined_gravity_never_triggers_a_correction(self):
+        """The guard that stops ordinary footage declaring itself slow motion."""
+        frames, xy = synthetic_flight(n=11, noise=8.0, seed=5)
+        fit = fit_ballistic(frames, xy, FPS)
+        assert fit.ay_stderr > 0.25 * fit.ay  # the window cannot measure gravity
+        base, _ = calib.resolve_time_base(FPS, fit, PX_PER_M, n_points=fit.n_points)
+        assert not base.corrected
 
 
 class TestMetrics:
@@ -227,3 +304,40 @@ class TestJointAngles:
         assert "straighter" in knee_angle_feedback(170.0)
         assert "within" in knee_angle_feedback(140.0)
         assert "not measurable" in knee_angle_feedback(float("nan"))
+
+
+class TestStatureValidation:
+    """The one number a camera cannot check, so the code checks it instead.
+
+    Every distance and speed is inversely proportional to the athlete's height,
+    so a units slip is not a small error, it is a factor of a hundred, and
+    nothing downstream can notice, because a scale is precisely what a single
+    camera has no independent handle on.
+    """
+
+    def test_a_plausible_height_passes_through(self):
+        assert anthro.check_stature(1.85) == pytest.approx(1.85)
+        assert anthro.check_stature(anthro.MIN_STATURE_M) == pytest.approx(anthro.MIN_STATURE_M)
+        assert anthro.check_stature(anthro.MAX_STATURE_M) == pytest.approx(anthro.MAX_STATURE_M)
+
+    def test_centimetres_are_caught_and_named(self):
+        with pytest.raises(ValueError, match="centimetres"):
+            anthro.check_stature(185)
+
+    def test_the_error_says_what_to_pass_instead(self):
+        with pytest.raises(ValueError, match=r"pass 1\.85"):
+            anthro.check_stature(185)
+
+    def test_a_height_that_is_merely_wrong_is_reported_as_out_of_range(self):
+        with pytest.raises(ValueError, match="plausible"):
+            anthro.check_stature(4.0)
+
+    def test_nonsense_is_rejected(self):
+        for bad in (0.0, -1.8, float("nan")):
+            with pytest.raises(ValueError):
+                anthro.check_stature(bad)
+
+    def test_the_calibration_rejects_it_too_not_just_the_cli(self):
+        """Belt and braces: the library is usable without going through argparse."""
+        with pytest.raises(ValueError, match="centimetres"):
+            calib.resolve(_body(370.0), stature_m=185)

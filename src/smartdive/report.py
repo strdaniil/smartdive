@@ -26,8 +26,9 @@ def write_csv(analysis: DiveAnalysis, path: str | Path) -> Path:
 
     traj = analysis.trajectory
     velocity = traj.velocity()
-    ppm = analysis.calibration.px_per_metre if analysis.calibration else None
+    calibration = analysis.calibration
     fit = analysis.fit
+    visible_mass = analysis.pose.visible_mass(analysis.config.min_keypoint_conf)
 
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.writer(handle)
@@ -44,6 +45,9 @@ def write_csv(analysis: DiveAnalysis, path: str | Path) -> Path:
                 "x_m",
                 "y_m",
                 "speed_m_s",
+                "px_per_metre",
+                "visible_mass",
+                "airborne",
                 "measured",
                 "outlier",
                 "interpolated",
@@ -51,9 +55,14 @@ def write_csv(analysis: DiveAnalysis, path: str | Path) -> Path:
             ]
         )
         for i, frame in enumerate(traj.frames):
-            t = frame / traj.fps
+            t = frame / analysis.fps
             x, y = traj.xy[i]
             vx, vy = velocity[i]
+            # Velocities come out of a derivative taken against container frames,
+            # so a slow-motion clip needs them restated on the real clock.
+            scale = analysis.fps / traj.fps
+            vx, vy = vx * scale, vy * scale
+            ppm = calibration.at(int(frame)) if calibration else None
             if ppm:
                 xm, ym = x / ppm, y / ppm
                 speed = float(np.hypot(vx, vy) / ppm) if np.isfinite(vx) else ""
@@ -80,6 +89,9 @@ def write_csv(analysis: DiveAnalysis, path: str | Path) -> Path:
                     _num(xm),
                     _num(ym),
                     _num(speed),
+                    _num(ppm) if ppm else "",
+                    _num(visible_mass[i]),
+                    int(analysis.airborne[i]),
                     int(traj.valid[i]),
                     int(traj.outliers[i]),
                     int(traj.interpolated[i]),
@@ -108,12 +120,14 @@ def plot_diagnostics(analysis: DiveAnalysis, path: str | Path) -> Path:
 
     traj = analysis.trajectory
     fit = analysis.fit
-    t = traj.frames / traj.fps
+    t = traj.frames / analysis.fps
 
-    fig, axes = plt.subplots(2, 2, figsize=(13, 8))
+    fig, axes = plt.subplots(2, 3, figsize=(18, 8))
+    subtitle = f"{analysis.config.landmark}, {analysis.config.backend}"
+    if analysis.time_base.corrected:
+        subtitle += f", {analysis.fps:g} fps capture (container says {analysis.video.fps:g})"
     fig.suptitle(
-        f"SmartDive diagnostics - {analysis.video.path.name} "
-        f"({analysis.config.landmark}, {analysis.config.backend})",
+        f"SmartDive diagnostics - {analysis.video.path.name}  ({subtitle})",
         fontsize=13,
     )
 
@@ -136,15 +150,15 @@ def plot_diagnostics(analysis: DiveAnalysis, path: str | Path) -> Path:
     if fit is not None:
         ft = np.linspace(0, fit.duration, 100)
         ax.plot(
-            fit.start_frame / traj.fps + ft,
+            fit.start_frame / analysis.fps + ft,
             fit.position(ft)[:, 1],
             "--",
             lw=2,
             color="#f08c00",
         )
         ax.axvspan(
-            fit.start_frame / traj.fps,
-            fit.end_frame / traj.fps,
+            fit.start_frame / analysis.fps,
+            fit.end_frame / analysis.fps,
             color="#f08c00",
             alpha=0.10,
             label="flight",
@@ -162,15 +176,15 @@ def plot_diagnostics(analysis: DiveAnalysis, path: str | Path) -> Path:
     if fit is not None:
         ft = np.linspace(0, fit.duration, 100)
         ax.plot(
-            fit.start_frame / traj.fps + ft,
+            fit.start_frame / analysis.fps + ft,
             fit.position(ft)[:, 0],
             "--",
             lw=2,
             color="#f08c00",
         )
         ax.axvspan(
-            fit.start_frame / traj.fps,
-            fit.end_frame / traj.fps,
+            fit.start_frame / analysis.fps,
+            fit.end_frame / analysis.fps,
             color="#f08c00",
             alpha=0.10,
         )
@@ -179,10 +193,46 @@ def plot_diagnostics(analysis: DiveAnalysis, path: str | Path) -> Path:
     ax.set_title("horizontal position: linear in free flight")
     ax.grid(alpha=0.25)
 
+    ax = axes[0][2]
+    mass = analysis.pose.visible_mass(analysis.config.min_keypoint_conf)
+    ax.plot(t, mass, "-", lw=1.8, color="#1971c2", label="visible body mass")
+    ax.axhline(
+        analysis.config.airborne_min_mass,
+        color="#868e96",
+        ls="--",
+        lw=1,
+        label="airborne threshold",
+    )
+    if fit is not None:
+        ax.axvspan(
+            fit.start_frame / analysis.fps,
+            fit.end_frame / analysis.fps,
+            color="#f08c00",
+            alpha=0.10,
+        )
+    ax.set_ylim(-0.05, 1.05)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("fraction resolved")
+    ax.set_title("water entry: the detector stops seeing the legs")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.25)
+
+    ax = axes[1][2]
+    drift = analysis.motion.to_reference
+    if len(drift):
+        ax.plot(t[: len(drift)], drift[:, 0, 2], "-", lw=1.8, label="horizontal")
+        ax.plot(t[: len(drift)], drift[:, 1, 2], "-", lw=1.8, label="vertical")
+    ax.axhline(0, color="#888888", lw=0.8)
+    ax.set_xlabel("time (s)")
+    ax.set_ylabel("camera offset (px)")
+    ax.set_title("camera motion removed before fitting")
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.25)
+
     ax = axes[1][1]
     if fit is not None:
         window = slice(fit.start_frame, fit.end_frame + 1)
-        wt = (traj.frames[window] - fit.start_frame) / traj.fps
+        wt = (traj.frames[window] - fit.start_frame) / analysis.fps
         observed = traj.xy[window]
         model = fit.position(wt)
         ax.axhline(0, color="#888888", lw=0.8)

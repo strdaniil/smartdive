@@ -9,10 +9,11 @@ from __future__ import annotations
 
 import math
 from dataclasses import asdict, dataclass
+from itertools import pairwise
 
 import numpy as np
 
-from smartdive.calibration import Calibration
+from smartdive.calibration import Calibration, TimeBase
 from smartdive.keypoints import (
     LEFT_ANKLE,
     LEFT_HIP,
@@ -42,8 +43,10 @@ class DiveMetrics:
     calibration_method: str
     fit_r_squared: float
     fit_residual_rms_px: float
+    effective_fps: float
     block_time_s: float | None = None
     set_knee_angle_deg: float | None = None
+    slow_motion_factor: float | None = None
 
     def to_dict(self) -> dict[str, object]:
         return {k: v for k, v in asdict(self).items()}
@@ -61,6 +64,15 @@ class DiveMetrics:
             ("Entry angle", f"{self.entry_angle_deg:.1f} deg"),
             ("Airborne frames", f"{self.takeoff_frame} to {self.entry_frame}"),
         ]
+        if self.slow_motion_factor is not None:
+            rows.insert(
+                0,
+                (
+                    "Capture rate",
+                    f"{self.effective_fps:g} fps"
+                    f" (clip is {self.slow_motion_factor:.2g}x slow motion)",
+                ),
+            )
         if self.block_time_s is not None:
             rows.insert(0, ("Block time", f"{self.block_time_s:.3f} s"))
         if self.set_knee_angle_deg is not None:
@@ -76,15 +88,41 @@ class DiveMetrics:
         return "\n".join(f"{k.ljust(width)}  {v}" for k, v in rows)
 
 
+def integrate_metres(
+    xy: np.ndarray,
+    frames: np.ndarray,
+    calibration: Calibration,
+    axis: int | None = None,
+) -> float:
+    """Path length (or one axis of displacement) in metres, scale by scale.
+
+    When the athlete's distance from the camera changes during the flight, a
+    single pixels-per-metre is wrong at one end of it or the other, so each
+    step is converted using the scale in force where that step happened. With a
+    constant calibration this reduces exactly to dividing by it once.
+    """
+    good = ~np.isnan(xy[:, 0])
+    xy, frames = xy[good], np.asarray(frames)[good]
+    if len(xy) < 2:
+        return 0.0
+    steps = np.diff(xy, axis=0)
+    scales = np.array([calibration.at(int((a + b) // 2)) for a, b in pairwise(frames)])
+    if axis is None:
+        return float(np.sum(np.linalg.norm(steps, axis=1) / scales))
+    return float(abs(np.sum(steps[:, axis] / scales)))
+
+
 def compute_metrics(
     fit: BallisticFit,
     calibration: Calibration,
     trajectory_px: np.ndarray | None = None,
+    frames: np.ndarray | None = None,
     block_time_s: float | None = None,
     set_knee_angle_deg: float | None = None,
+    time_base: TimeBase | None = None,
 ) -> DiveMetrics:
     """Convert a ballistic fit plus a scale into SI dive metrics."""
-    ppm = calibration.px_per_metre
+    ppm = calibration.at(fit.start_frame)
 
     vx = fit.vx / ppm
     vy = fit.vy / ppm  # image y grows downward
@@ -108,9 +146,13 @@ def compute_metrics(
     entry_angle = math.degrees(math.atan2(vy_entry, abs(fit.vx))) if fit.vx else 90.0
 
     if trajectory_px is not None and len(trajectory_px) >= 2:
-        good = trajectory_px[~np.isnan(trajectory_px[:, 0])]
-        if len(good) >= 2:
-            horizontal = max(horizontal, abs(good[-1, 0] - good[0, 0]) / ppm)
+        window_frames = (
+            np.arange(fit.start_frame, fit.start_frame + len(trajectory_px))
+            if frames is None
+            else frames
+        )
+        measured = integrate_metres(trajectory_px, window_frames, calibration, axis=0)
+        horizontal = max(horizontal, measured)
 
     return DiveMetrics(
         takeoff_frame=fit.start_frame,
@@ -127,8 +169,12 @@ def compute_metrics(
         calibration_method=calibration.method,
         fit_r_squared=fit.r_squared,
         fit_residual_rms_px=fit.residual_rms,
+        effective_fps=fit.fps,
         block_time_s=block_time_s,
         set_knee_angle_deg=set_knee_angle_deg,
+        slow_motion_factor=(
+            None if time_base is None or not time_base.corrected else 1.0 / time_base.factor
+        ),
     )
 
 

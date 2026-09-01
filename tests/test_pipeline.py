@@ -1,8 +1,14 @@
 """End-to-end pipeline tests against a synthetic video and a fake backend.
 
 These run in CI without model weights, network access, or sample footage: the
-backend is stubbed, so what is under test is the pipeline's own wiring --
+backend is stubbed, so what is under test is the pipeline's own wiring,
 tracking, conditioning, phase detection, calibration and export.
+
+The clip is a black rectangle, which means the camera-motion estimator finds no
+features and correctly reports no motion. That is a real path through the code
+and worth exercising, but it is also why these tests say nothing about
+stabilisation; :mod:`tests.test_camera` covers that separately, on a synthetic
+scene that actually moves.
 """
 
 from __future__ import annotations
@@ -18,82 +24,54 @@ import pytest
 cv2 = pytest.importorskip("cv2")
 
 from smartdive.analysis import AnalysisConfig, analyze, subject_switches  # noqa: E402
-from smartdive.backends.base import FrameDetections, PersonDetection, PoseBackend  # noqa: E402
-from smartdive.calibration import DEFAULT_STATURE_M, EXTENDED_BODY_RATIO  # noqa: E402
-from smartdive.keypoints import NUM_KEYPOINTS  # noqa: E402
 from smartdive.legacy import legacy_metrics, legacy_trajectory  # noqa: E402
-from smartdive.physics import G  # noqa: E402
 from smartdive.report import write_csv, write_json  # noqa: E402
+from tests.synthetic import ScriptedBackend  # noqa: E402
 
 FPS = 60.0
 PX_PER_M = 150.0
+STATURE_M = 1.80
+STATURE_PX = STATURE_M * PX_PER_M
 TAKEOFF, ENTRY, N_FRAMES = 20, 50, 80
-
-#: Keep the synthetic world self-consistent: a figure this many pixels tall is
-#: exactly a default-stature athlete at PX_PER_M, so the body-scale prior the
-#: pipeline derives should land on the scale the fixture actually used.
-BODY_PX = DEFAULT_STATURE_M * EXTENDED_BODY_RATIO * PX_PER_M
+VX_MS, VY_MS = 5.0, 1.2
 
 
-def _pose(
-    cx: float,
-    cy: float,
-    size: float,
-    score: float = 0.8,
-    submerged: bool = False,
-) -> PersonDetection:
-    xy = np.zeros((NUM_KEYPOINTS, 2))
-    spread = np.linspace(-0.5, 0.5, NUM_KEYPOINTS)
-    xy[:, 0] = cx + spread * size * 0.25
-    xy[:, 1] = cy + spread * size
-    conf = np.full(NUM_KEYPOINTS, 0.9)
-    if submerged:
-        # Everything from the hips down disappears below the surface, which is
-        # what the real footage shows: the visible mass fraction falls off a
-        # cliff the moment the athlete breaks the water.
-        conf[11:] = 0.05
-    return PersonDetection(
-        box=np.array([cx - size / 2, cy - size / 2, cx + size / 2, cy + size / 2]),
-        score=score,
-        xy=xy,
-        conf=conf,
+def _backend(**kwargs) -> ScriptedBackend:
+    options = dict(
+        takeoff=TAKEOFF,
+        entry=ENTRY,
+        fps=FPS,
+        px_per_m=PX_PER_M,
+        stature_px=STATURE_PX,
+        vx_ms=VX_MS,
+        vy_ms=VY_MS,
     )
+    options.update(kwargs)
+    return ScriptedBackend(**options)
 
 
-class ScriptedBackend(PoseBackend):
-    """A backend that replays a known dive plus a stationary bystander."""
-
-    name = "scripted"
-
-    def detect(self, frame: np.ndarray, index: int) -> FrameDetections:
-        # The bystander is stationary, well lit and unoccluded, so the detector
-        # is consistently more confident about them than about the athlete.
-        people = [_pose(1500.0, 500.0, BODY_PX * 0.9, score=0.93)]
-
-        if index < TAKEOFF:
-            people.insert(0, _pose(200.0, 400.0, BODY_PX, score=0.78))
-        else:
-            t = (index - TAKEOFF) / FPS
-            cx = 200.0 + 5.0 * PX_PER_M * t
-            cy = 400.0 - 1.2 * PX_PER_M * t + 0.5 * G * PX_PER_M * t**2
-            people.insert(0, _pose(cx, cy, BODY_PX, score=0.78, submerged=index > ENTRY))
-        return FrameDetections(index=index, people=people)
+def _config(**kwargs) -> AnalysisConfig:
+    options = dict(backend="scripted", bootstrap=50, refine=False, stature_m=STATURE_M)
+    options.update(kwargs)
+    return AnalysisConfig(**options)
 
 
-@pytest.fixture(scope="module")
-def clip(tmp_path_factory) -> object:
-    path = tmp_path_factory.mktemp("video") / "dive.mp4"
+def _blank_clip(path, n_frames: int):
     writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"), FPS, (1920, 1080))
-    for _ in range(N_FRAMES):
+    for _ in range(n_frames):
         writer.write(np.zeros((1080, 1920, 3), dtype=np.uint8))
     writer.release()
     return path
 
 
 @pytest.fixture(scope="module")
+def clip(tmp_path_factory):
+    return _blank_clip(tmp_path_factory.mktemp("video") / "dive.mp4", N_FRAMES)
+
+
+@pytest.fixture(scope="module")
 def result(clip):
-    config = AnalysisConfig(landmark="hips", backend="scripted", bootstrap=50)
-    return analyze(clip, config, backend=ScriptedBackend())
+    return analyze(clip, _config(), backend=_backend())
 
 
 def test_pipeline_selects_the_diver_not_the_bystander(result):
@@ -121,12 +99,20 @@ def test_flight_phase_matches_the_script(result):
     assert result.metrics.entry_frame == pytest.approx(ENTRY, abs=3)
 
 
+def test_the_scale_is_recovered_from_the_athletes_own_proportions(result):
+    """Generate a body at a known pixel stature; the calibration must find it."""
+    assert result.body.stature_px == pytest.approx(STATURE_PX, rel=0.05)
+    assert result.calibration is not None
+    assert result.calibration.px_per_metre == pytest.approx(PX_PER_M, rel=0.05)
+    assert result.calibration.method == "stature"
+
+
 def test_metrics_are_in_si_units_and_near_the_truth(result):
     m = result.metrics
     assert m is not None
-    assert m.horizontal_velocity_ms == pytest.approx(5.0, rel=0.2)
-    assert m.takeoff_angle_deg > 0
-    assert 0.0 < m.flight_time_s < 1.0
+    assert m.horizontal_velocity_ms == pytest.approx(VX_MS, rel=0.1)
+    assert m.vertical_velocity_ms == pytest.approx(VY_MS, rel=0.25)
+    assert m.flight_time_s == pytest.approx((ENTRY - TAKEOFF) / FPS, rel=0.2)
     assert m.flight_distance_m > 1.0
 
 
@@ -143,6 +129,8 @@ def test_report_round_trips_through_json(result, tmp_path):
     assert payload["metrics"]["flight_time_s"] == pytest.approx(result.metrics.flight_time_s)
     assert payload["video"]["fps"] == pytest.approx(FPS)
     assert payload["flight"]["takeoff_frame"] == result.metrics.takeoff_frame
+    assert payload["time_base"]["method"] == "container"
+    assert payload["body"]["stature_px"] == pytest.approx(result.body.stature_px, abs=0.1)
     assert isinstance(payload["warnings"], list)
 
 
@@ -155,14 +143,11 @@ def test_csv_labels_every_frame_with_its_phase(result, tmp_path):
     assert len(rows) == N_FRAMES
     phases = {r["phase"] for r in rows}
     assert phases == {"block", "flight", "water"}
-    assert rows[TAKEOFF + 2]["phase"] == "flight"
+    assert rows[result.metrics.takeoff_frame + 2]["phase"] == "flight"
 
 
 def test_manual_window_override_is_honoured(clip):
-    config = AnalysisConfig(
-        landmark="hips", backend="scripted", bootstrap=0, flight_window=(25, 45)
-    )
-    manual = analyze(clip, config, backend=ScriptedBackend())
+    manual = analyze(clip, _config(bootstrap=0, flight_window=(25, 45)), backend=_backend())
 
     assert manual.metrics is not None
     assert manual.metrics.takeoff_frame == 25
@@ -170,13 +155,43 @@ def test_manual_window_override_is_honoured(clip):
 
 
 def test_detections_are_cached_and_reused(clip, tmp_path):
-    config = AnalysisConfig(landmark="hips", backend="scripted", bootstrap=0)
-    first = analyze(clip, config, backend=ScriptedBackend(), cache=tmp_path)
+    config = _config(bootstrap=0)
+    first = analyze(clip, config, backend=_backend(), cache=tmp_path)
     assert list(tmp_path.glob("*.pkl"))
 
     # Second call must not need a backend at all.
     second = analyze(clip, config, backend=None, cache=tmp_path)
     assert second.metrics.flight_time_s == pytest.approx(first.metrics.flight_time_s)
+
+
+def test_slow_motion_is_detected_and_the_clock_corrected(tmp_path):
+    """A clip whose container frame rate is four times slower than capture.
+
+    The same dive, filmed at 240 fps and written into a 60 fps container: every
+    pixel of it is identical to the real-time version, and only the relationship
+    between frames and seconds differs. Without the correction the pipeline
+    reports a quarter of the real speed and four times the real flight time,
+    with nothing in the footage to say otherwise.
+    """
+    slow_takeoff, slow_entry, n = 40, 40 + 4 * (ENTRY - TAKEOFF), 4 * N_FRAMES
+    path = _blank_clip(tmp_path / "slow.mp4", n)
+    slow = analyze(
+        path,
+        _config(bootstrap=0),
+        backend=_backend(time_scale=0.25, takeoff=slow_takeoff, entry=slow_entry),
+    )
+
+    assert slow.time_base.corrected
+    assert slow.fps == pytest.approx(FPS * 4, rel=0.2)
+    assert slow.metrics is not None
+    assert slow.metrics.horizontal_velocity_ms == pytest.approx(VX_MS, rel=0.15)
+    assert slow.metrics.flight_time_s == pytest.approx((ENTRY - TAKEOFF) / FPS, rel=0.25)
+
+
+def test_real_time_footage_is_not_mistaken_for_slow_motion(result):
+    """The other half of the same test, and the easier one to get wrong."""
+    assert not result.time_base.corrected
+    assert result.fps == pytest.approx(FPS)
 
 
 def test_subject_switches_counts_impossible_jumps():

@@ -253,8 +253,8 @@ def noise_scale(xy: np.ndarray) -> float:
     Dividing the observed second-difference RMS by ``sqrt(6)`` therefore
     recovers the noise without needing to know the trajectory.
 
-    This matters because the obvious alternative -- taking the residual of the
-    best-fitting window as the noise estimate -- is biased low precisely
+    This matters because the obvious alternative, taking the residual of the
+    best-fitting window as the noise estimate, is biased low precisely
     *because* that window was chosen for having the smallest residual.
     """
     j = jitter(xy)

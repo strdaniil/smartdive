@@ -2,7 +2,7 @@
 
 MediaPipe is single-person and CPU-friendly. It is kept as a fallback so the
 pipeline runs without torch, and as an independent detector for cross-checking
-results -- if two unrelated detectors agree on the takeoff velocity, the number
+results, if two unrelated detectors agree on the takeoff velocity, the number
 is probably real.
 """
 

@@ -21,12 +21,7 @@ from pathlib import Path
 
 import numpy as np
 
-from smartdive.analysis import (
-    AnalysisConfig,
-    _body_scales,
-    analyze,
-    subject_switches,
-)
+from smartdive.analysis import AnalysisConfig, analyze, subject_switches
 from smartdive.backends import get_backend
 from smartdive.legacy import legacy_metrics, legacy_trajectory
 from smartdive.signal import jitter
@@ -49,6 +44,8 @@ class Comparison:
     old_distance_px: float | None
     old_fit_rms: float | None
     # current
+    capture_fps: float
+    slow_motion: bool
     new_coverage: float
     new_travel_bodies: float
     new_jitter_raw: float
@@ -87,7 +84,7 @@ def subject_agreement(result, min_conf: float) -> float:
 
     The original pipeline chose the subject independently in every frame, by
     detector confidence. This measures how often that choice was the person the
-    tracker follows through the whole clip -- i.e. how often the old approach
+    tracker follows through the whole clip, i.e. how often the old approach
     was looking at the diver at all.
     """
     agree = total = 0
@@ -110,7 +107,7 @@ def compare(video: Path, config: AnalysisConfig, backend, cache: Path | None = N
     # --- legacy pipeline, on the identical detections ---------------------
     legacy_xy = legacy_trajectory(result.detections, landmark="hips")
     legacy = legacy_metrics(legacy_xy, result.video.fps)
-    scale_px, _ = _body_scales(result.subject, config.min_keypoint_conf)
+    scale_px = result.body_scale_px
 
     quality = result.quality()
     m = result.metrics
@@ -128,6 +125,8 @@ def compare(video: Path, config: AnalysisConfig, backend, cache: Path | None = N
             old_flight_time=legacy.flight_time_s if legacy else None,
             old_distance_px=legacy.horizontal_distance_px if legacy else None,
             old_fit_rms=legacy.poly_residual_rms_px if legacy else None,
+            capture_fps=result.fps,
+            slow_motion=result.time_base.corrected,
             new_coverage=quality["coverage"],
             new_travel_bodies=travel_bodies(result.trajectory.xy, scale_px),
             new_jitter_raw=quality["jitter_raw_px"],
@@ -237,6 +236,8 @@ def markdown_table(rows: list[Comparison]) -> str:
             if r.new_flight_time is None
             else f"{r.new_flight_time:.2f} s, {r.new_speed_ms:.1f} m/s, {r.new_distance_m:.1f} m"
         )
+        if r.slow_motion:
+            new_result += f"<br><sub>at {r.capture_fps:g} fps capture</sub>"
         lines.append(
             f"| **`{r.clip}`**<br><sub>{r.frames} frames</sub> | original "
             f"| {r.subject_agreement:.0%} of frames "
@@ -253,13 +254,63 @@ def markdown_table(rows: list[Comparison]) -> str:
     return "\n".join(lines)
 
 
+#: Clips known to be the same dive exported at different playback rates. Their
+#: results should agree, which is the only ground truth available here that does
+#: not require a tape measure at the poolside.
+DUPLICATE_PAIRS: tuple[tuple[str, str], ...] = (("adive.mp4", "adive2.mp4"),)
+
+
+def duplicate_check(rows: list[Comparison]) -> str:
+    """Compare clips that are the same dive at different playback rates.
+
+    There is no measured ground truth for this footage, but there is something
+    almost as useful: two exports of the same start, one real time and one four
+    times slow. Nothing about the athlete differs between them, so any
+    disagreement in the reported metrics is the pipeline's own error, and it
+    exercises the slow-motion detection, which has to recover a capture rate of
+    120 fps from a container claiming 30, or the two will not agree at all.
+    """
+    index = {r.clip: r for r in rows}
+    lines: list[str] = []
+    for a, b in DUPLICATE_PAIRS:
+        first, second = index.get(a), index.get(b)
+        if not first or not second or not first.new_flight_time or not second.new_flight_time:
+            continue
+        lines.append(
+            f"**Self-consistency: `{a}` vs `{b}`**, the same dive, "
+            f"`{b}` exported at four times slow motion. Nothing about the athlete "
+            "differs, so every disagreement below is the pipeline's own error."
+        )
+        lines.append("")
+        lines.append(f"| quantity | {a} | {b} | agreement |")
+        lines.append("|---|---|---|---|")
+        lines.append(
+            f"| capture rate recovered (fps) | {first.capture_fps:.0f} | "
+            f"{second.capture_fps:.0f} | should differ by 4x |"
+        )
+        for label, x, y, spec in (
+            ("flight time (s)", first.new_flight_time, second.new_flight_time, "{:.3f}"),
+            ("takeoff speed (m/s)", first.new_speed_ms, second.new_speed_ms, "{:.2f}"),
+            ("flight distance (m)", first.new_distance_m, second.new_distance_m, "{:.2f}"),
+        ):
+            delta = abs(y - x) / x if x else float("nan")
+            lines.append(f"| {label} | {spec.format(x)} | {spec.format(y)} | {delta:.0%} |")
+    return "\n".join(lines)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("videos", nargs="+", type=Path)
     parser.add_argument("-o", "--outdir", type=Path, default=Path("benchmarks/results"))
-    parser.add_argument("--landmark", default="hips")
+    parser.add_argument(
+        "--landmark",
+        default="com",
+        help="what the current pipeline tracks; the legacy re-implementation "
+        "always uses the hip midpoint, because that is what it tracked",
+    )
     parser.add_argument("--weights", default="yolo11m-pose.pt")
     parser.add_argument("--imgsz", type=int, default=1280)
+    parser.add_argument("--no-refine", action="store_true")
     parser.add_argument(
         "--cache",
         type=Path,
@@ -269,7 +320,7 @@ def main() -> int:
     args = parser.parse_args()
 
     args.outdir.mkdir(parents=True, exist_ok=True)
-    config = AnalysisConfig(landmark=args.landmark, bootstrap=200)
+    config = AnalysisConfig(landmark=args.landmark, bootstrap=200, refine=not args.no_refine)
     backend = get_backend("yolo", weights=args.weights, imgsz=args.imgsz, conf=0.15)
 
     rows: list[Comparison] = []
@@ -294,6 +345,9 @@ def main() -> int:
         json.dumps([r.to_dict() for r in rows], indent=2), encoding="utf-8"
     )
     table = markdown_table(rows)
+    consistency = duplicate_check(rows)
+    if consistency:
+        table += "\n\n" + consistency
     (args.outdir / "benchmark.md").write_text(table + "\n", encoding="utf-8")
     print("\n" + table)
     print(f"\ntotal {time.perf_counter() - started:.0f} s -> {args.outdir}")

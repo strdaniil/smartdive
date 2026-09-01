@@ -1,187 +1,150 @@
-"""Render the side-by-side demos used in the README.
+"""Render the side-by-side demo assets used in the README.
 
-For each clip this produces:
+For each clip this produces three files in ``assets/``:
 
-* ``<clip>_original.mp4`` -- the original pipeline's overlay, reproduced from
-  its own code path (argmax subject, no conditioning, cubic fit over the whole
-  clip).
-* ``<clip>_smartdive3.mp4`` -- the current overlay.
-* ``<clip>_sidebyside.mp4`` and ``.gif`` -- the two stacked, for the README.
+* ``<clip>_original.mp4``, the legacy pipeline's overlay, drawn by the same
+  renderer so the comparison is about the measurement and not the graphics;
+* ``<clip>_smartdive3.mp4``, the current pipeline's overlay;
+* ``<clip>_sidebyside.mp4``, the two stacked, which is the honest way to show
+  the difference: the same frames, the same detections, two conclusions;
+* ``<clip>_sidebyside.gif``, the same thing as a GIF for the README, if
+  ``ffmpeg`` is on the path.
 
-    python benchmarks/make_demos.py videos/adive.mp4 -o assets --cache .cache
+    python benchmarks/make_demos.py videos/adive.mp4 --cache .cache
 """
 
 from __future__ import annotations
 
 import argparse
+import shutil
+import subprocess
 from pathlib import Path
 
 import cv2
 import numpy as np
 
 from smartdive.analysis import AnalysisConfig, analyze
-from smartdive.legacy import LEGACY_POLY_DEGREE, legacy_metrics, legacy_trajectory
+from smartdive.legacy import legacy_metrics, legacy_trajectory
 from smartdive.render import render_comparison, render_overlay
 from smartdive.video import VideoWriter
 from smartdive.video import frames as iter_frames
 
-# The original scripts' colours: green measured trail, yellow/red cubic fit.
-LEGACY_TRAIL = (0, 255, 0)
-LEGACY_FIT = (0, 255, 255)
+LEGACY_COLOR = (90, 220, 120)
+PANEL = (28, 24, 20)
 TEXT = (240, 240, 240)
 
 
-def render_legacy_overlay(video: Path, trajectory: np.ndarray, fps: float, out: Path) -> Path:
-    """Reproduce the original overlay_video.py / polyfit.py output."""
-    metrics = legacy_metrics(trajectory, fps)
-    fit_points = None
-    if metrics is not None:
-        valid = np.where(~np.isnan(trajectory[:, 0]))[0]
-        t = np.linspace(valid[0], valid[-1], 200)
-        fit_points = np.stack(
-            [np.polyval(metrics.poly_x, t), np.polyval(metrics.poly_y, t)], axis=1
-        ).astype(np.int32)
+def render_legacy(result, output: Path) -> Path:
+    """Draw what the original pipeline saw, using the current renderer.
 
-    cap = cv2.VideoCapture(str(video))
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cap.release()
-    scale = max(0.6, min(width, height) / 720.0)
+    Deliberately reproduces its *output*, not a caricature of it: the trail is
+    the per-frame argmax landmark it actually tracked, and the caption is the
+    metric it actually printed. What the picture shows, a short tangle of line
+    somewhere other than the diver, with a confident number beside it, is
+    what that code produced.
+    """
+    xy = legacy_trajectory(result.detections, landmark="hips")
+    metrics = legacy_metrics(xy, result.video.fps)
+    info = result.video
+    scale = max(0.6, min(info.width, info.height) / 720.0)
     thickness = max(2, round(2 * scale))
 
-    with VideoWriter(out, fps, (width, height)) as writer:
-        for index, frame in iter_frames(video):
-            upto = trajectory[: index + 1]
+    caption = [
+        "original pipeline",
+        "argmax subject, degree-3 fit over whole clip",
+    ]
+    if metrics is not None:
+        caption.append(
+            f"flight {metrics.flight_time_s:.2f} s, {metrics.horizontal_distance_px:.0f} px"
+        )
+
+    with VideoWriter(output, info.fps, (info.width, info.height)) as writer:
+        for index, frame in iter_frames(info.path):
+            upto = xy[: index + 1]
             good = ~np.isnan(upto[:, 0])
             if good.any():
-                pts = np.round(upto[good]).astype(np.int32)
-                if len(pts) > 1:
-                    cv2.polylines(frame, [pts], False, LEGACY_TRAIL, thickness, cv2.LINE_AA)
-                cv2.circle(frame, tuple(pts[-1]), thickness + 3, LEGACY_TRAIL, -1, cv2.LINE_AA)
-            if fit_points is not None:
-                cv2.polylines(frame, [fit_points], False, LEGACY_FIT, thickness, cv2.LINE_AA)
-
-            label = [
-                "original pipeline",
-                f"argmax subject, degree-{LEGACY_POLY_DEGREE} fit over whole clip",
-            ]
-            if metrics is not None:
-                label.append(
-                    f"flight {metrics.flight_time_s:.2f} s, {metrics.horizontal_distance_px:.0f} px"
-                )
-            _caption(frame, label, scale)
+                points = np.round(upto[good]).astype(np.int32)
+                if len(points) > 1:
+                    cv2.polylines(frame, [points], False, LEGACY_COLOR, thickness, cv2.LINE_AA)
+                cv2.circle(frame, tuple(points[-1]), thickness + 3, LEGACY_COLOR, -1, cv2.LINE_AA)
+            _caption(frame, caption, scale)
             writer.write(frame)
-    return out
+    return output
 
 
 def _caption(frame: np.ndarray, lines: list[str], scale: float) -> None:
     font = cv2.FONT_HERSHEY_SIMPLEX
     fs = 0.55 * scale
     pad = int(14 * scale)
-    lh = int(26 * scale)
-    w = max(cv2.getTextSize(t, font, fs, 1)[0][0] for t in lines) + 2 * pad
-    h = len(lines) * lh + pad
+    line_h = int(24 * scale)
+    width = max(cv2.getTextSize(t, font, fs, 1)[0][0] for t in lines) + 2 * pad
+    height = len(lines) * line_h + pad
+
     overlay = frame.copy()
-    cv2.rectangle(overlay, (pad, pad), (pad + w, pad + h), (28, 24, 20), -1)
-    cv2.addWeighted(overlay, 0.88, frame, 0.12, 0, frame)
-    y = pad + lh - int(6 * scale)
+    cv2.rectangle(overlay, (pad, pad), (pad + width, pad + height), PANEL, -1)
+    cv2.addWeighted(overlay, 0.85, frame, 0.15, 0, frame)
+    y = pad + line_h - int(6 * scale)
     for text in lines:
         cv2.putText(frame, text, (pad * 2, y), font, fs, TEXT, max(1, int(scale)), cv2.LINE_AA)
-        y += lh
+        y += line_h
 
 
-def write_gif(
-    video: Path, out: Path, width: int = 640, fps: float = 12.0, colors: int = 96
-) -> Path | None:
-    """Best-effort animated GIF for embedding in the README."""
-    try:
-        from PIL import Image
-    except ImportError:
-        print("  (Pillow not installed, skipping GIF)")
+def to_gif(video: Path, output: Path, width: int, fps: int = 12) -> Path | None:
+    """Convert a rendered comparison to a GIF, via ffmpeg's two-pass palette.
+
+    A single shared palette for the whole clip rather than per-frame dithering:
+    the background is nearly static, so one palette keeps the pool from
+    shimmering between frames and roughly halves the file.
+    """
+    if shutil.which("ffmpeg") is None:
+        print("  (ffmpeg not found; skipping the GIF)", flush=True)
         return None
-
-    cap = cv2.VideoCapture(str(video))
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    stride = max(1, round(src_fps / fps))
-    frames_out = []
-    index = 0
-    while True:
-        ok, frame = cap.read()
-        if not ok:
-            break
-        if index % stride == 0:
-            h, w = frame.shape[:2]
-            resized = cv2.resize(frame, (width, int(h * width / w)))
-            frames_out.append(Image.fromarray(cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)))
-        index += 1
-    cap.release()
-
-    if not frames_out:
-        return None
-    out.parent.mkdir(parents=True, exist_ok=True)
-    # Quantise to a shared adaptive palette: a full-colour GIF of poolside
-    # footage runs to tens of megabytes, which is not something to put in a
-    # README.
-    palette = frames_out[0].quantize(colors=colors, method=Image.MEDIANCUT)
-    quantised = [f.quantize(colors=colors, palette=palette) for f in frames_out]
-    quantised[0].save(
-        out,
-        save_all=True,
-        append_images=quantised[1:],
-        duration=int(1000 / fps),
-        loop=0,
-        optimize=True,
+    chain = (
+        f"fps={fps},scale={width}:-1:flags=lanczos,split[a][b];"
+        "[a]palettegen=max_colors=96[p];[b][p]paletteuse=dither=bayer:bayer_scale=3"
     )
-    return out
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(video), "-vf", chain, "-loop", "0", str(output)],
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return output
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("videos", nargs="+", type=Path)
     parser.add_argument("-o", "--outdir", type=Path, default=Path("assets"))
-    parser.add_argument("--landmark", default="hips")
-    parser.add_argument("--cache", type=Path, default=Path(".cache"))
-    parser.add_argument("--gif-width", type=int, default=640)
-    parser.add_argument("--gif-colors", type=int, default=96)
+    parser.add_argument("--cache", type=Path, default=None)
+    parser.add_argument("--width", type=int, default=960, help="width of the stacked video")
+    parser.add_argument("--gif-width", type=int, default=440, help="width of the README GIF")
     parser.add_argument("--no-gif", action="store_true")
     args = parser.parse_args()
 
     args.outdir.mkdir(parents=True, exist_ok=True)
-    config = AnalysisConfig(landmark=args.landmark, bootstrap=0)
+    config = AnalysisConfig(bootstrap=0)
 
     for video in args.videos:
-        print(f"[{video.name}]")
+        print(f"[{video.name}] ...", flush=True)
         result = analyze(video, config, cache=args.cache)
-        stem = video.stem
 
-        legacy_xy = legacy_trajectory(result.detections, landmark="hips")
-        old = render_legacy_overlay(
-            video, legacy_xy, result.video.fps, args.outdir / f"{stem}_original.mp4"
-        )
-        print(f"  {old}")
-
-        new = render_overlay(result, args.outdir / f"{stem}_smartdive3.mp4")
-        print(f"  {new}")
-
+        original = render_legacy(result, args.outdir / f"{video.stem}_original.mp4")
+        current = render_overlay(result, args.outdir / f"{video.stem}_smartdive3.mp4")
         combined = render_comparison(
-            old,
-            new,
-            args.outdir / f"{stem}_sidebyside.mp4",
+            original,
+            current,
+            args.outdir / f"{video.stem}_sidebyside.mp4",
             top_label="original pipeline",
             bottom_label="SmartDive 3",
+            width=args.width,
         )
-        print(f"  {combined}")
+        print(f"  {original}\n  {current}\n  {combined}", flush=True)
 
         if not args.no_gif:
-            gif = write_gif(
-                combined,
-                args.outdir / f"{stem}_sidebyside.gif",
-                args.gif_width,
-                colors=args.gif_colors,
-            )
-            if gif:
-                size_mb = gif.stat().st_size / 1e6
-                print(f"  {gif} ({size_mb:.1f} MB)")
+            gif = to_gif(combined, args.outdir / f"{video.stem}_sidebyside.gif", args.gif_width)
+            if gif is not None:
+                print(f"  {gif}", flush=True)
     return 0
 
 

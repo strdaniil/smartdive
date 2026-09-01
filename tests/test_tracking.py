@@ -1,4 +1,4 @@
-"""Tracking and subject selection -- the bug that made the old pipeline lie."""
+"""Tracking and subject selection, the bug that made the old pipeline lie."""
 
 from __future__ import annotations
 
@@ -8,7 +8,15 @@ import pytest
 from smartdive.backends.base import FrameDetections, PersonDetection
 from smartdive.keypoints import LEFT_HIP, NUM_KEYPOINTS, RIGHT_HIP
 from smartdive.legacy import legacy_trajectory
-from smartdive.tracking import TrackerConfig, iou, select_subject, track_all
+from smartdive.tracking import (
+    Track,
+    TrackerConfig,
+    iou,
+    keypoint_distance,
+    select_subject,
+    stitch_tracks,
+    track_all,
+)
 
 
 def person(cx: float, cy: float, size: float = 200.0, score: float = 0.8) -> PersonDetection:
@@ -105,3 +113,63 @@ def test_a_low_confidence_phantom_cannot_win_on_displacement_alone():
 def test_no_tracks_is_an_error_not_a_silent_wrong_answer():
     with pytest.raises(ValueError, match="found nobody"):
         select_subject([])
+
+
+def test_keypoint_distance_needs_enough_shared_confident_points():
+    xy = np.zeros((NUM_KEYPOINTS, 2))
+    high = np.full(NUM_KEYPOINTS, 0.9)
+    low = np.full(NUM_KEYPOINTS, 0.1)
+    assert keypoint_distance(xy, high, xy + 5.0, high) == pytest.approx(5.0 * np.sqrt(2))
+    assert np.isnan(keypoint_distance(xy, high, xy, low))
+
+
+class TestStitching:
+    """Reconnecting the fragments a strict tracker leaves behind."""
+
+    @staticmethod
+    def _fragment(track_id: int, frames: range, x0: float, step: float) -> Track:
+        track = Track(track_id=track_id)
+        for i in frames:
+            track.observations[i] = person(x0 + step * i, 500.0, size=200.0)
+        track.last_frame = max(frames)
+        track.box = track.observations[track.last_frame].box.copy()
+        return track
+
+    def test_a_gap_between_two_halves_of_one_person_is_bridged(self):
+        """What takeoff does to a tracker: the body changes shape and it lets go."""
+        a = self._fragment(1, range(0, 10), 400.0, 30.0)
+        b = self._fragment(2, range(14, 26), 400.0, 30.0)
+
+        merged = stitch_tracks([a, b], TrackerConfig())
+
+        assert len(merged) == 1
+        assert len(merged[0].observations) == 22
+
+    def test_two_people_moving_apart_are_not_stitched(self):
+        a = self._fragment(1, range(0, 10), 400.0, 30.0)
+        b = self._fragment(2, range(14, 26), 2400.0, -30.0)
+
+        assert len(stitch_tracks([a, b], TrackerConfig())) == 2
+
+    def test_fragments_that_overlap_in_time_are_merged_when_they_agree(self):
+        """A strict tracker opens the new fragment before it closes the old one."""
+        a = self._fragment(1, range(0, 20), 400.0, 30.0)
+        b = self._fragment(2, range(14, 30), 400.0, 30.0)
+
+        merged = stitch_tracks([a, b], TrackerConfig())
+
+        assert len(merged) == 1
+        assert len(merged[0].observations) == 30
+
+    def test_stitching_rescues_a_subject_broken_into_pieces(self):
+        """Displacement per fragment is small; peak speed is not, which is why
+        subject selection ranks on speed."""
+        frames = []
+        for i in range(40):
+            people = [person(1750, 560, size=180, score=0.9)]  # the bystander
+            if i < 12 or i > 17:  # the diver, lost through takeoff
+                people.append(person(1800 - 40 * i, 500.0, size=220, score=0.6))
+            frames.append(FrameDetections(index=i, people=people))
+
+        subject, _ = select_subject(track_all(frames))
+        assert np.ptp([d.center[0] for d in subject.observations.values()]) > 1000

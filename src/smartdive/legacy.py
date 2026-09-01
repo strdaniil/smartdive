@@ -7,7 +7,7 @@ frames, from the same detections where possible, and compares the results.
 The behaviour reproduced here, and the file it came from:
 
 * ``argmax`` over per-frame detector confidence to choose the subject
-  (``process_video.py:run_pose_estimation``) -- no association across frames.
+  (``process_video.py:run_pose_estimation``), no association across frames.
 * A fixed 0.5 keypoint-confidence gate, emitting NaN below it, with no gap
   filling, outlier rejection or smoothing (``utils.py:get_landmark_point``).
 * A degree-3 polynomial in ``t`` fit to ``x`` and ``y`` independently over the

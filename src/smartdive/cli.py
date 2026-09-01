@@ -7,7 +7,7 @@ import json
 import sys
 from pathlib import Path
 
-from smartdive import __version__
+from smartdive import __version__, anthro
 from smartdive.analysis import AnalysisConfig, analyze
 from smartdive.backends import BACKENDS
 from smartdive.keypoints import LANDMARKS
@@ -59,6 +59,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="override automatic phase detection with explicit frame numbers",
     )
     run.add_argument(
+        "--no-refine",
+        action="store_true",
+        help="skip the second-pass follow-crop detection (faster, less complete)",
+    )
+    run.add_argument(
+        "--no-stabilise",
+        action="store_true",
+        help="skip camera-motion compensation (only correct for locked-off footage)",
+    )
+    run.add_argument(
+        "--cache",
+        type=Path,
+        default=None,
+        help="directory in which to memoise detections and camera motion",
+    )
+    run.add_argument(
         "--min-conf",
         type=float,
         default=0.3,
@@ -73,7 +89,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     scale.add_argument("--reference-px", type=float, default=None, help="known length, in pixels")
     scale.add_argument("--reference-m", type=float, default=None, help="the same length, in metres")
-    scale.add_argument("--stature-m", type=float, default=None, help="athlete height in metres")
+    scale.add_argument(
+        "--stature-m",
+        type=float,
+        default=None,
+        metavar="METRES",
+        help=(
+            "the athlete's height in metres, e.g. 1.85. This is the single most "
+            "useful thing you can tell SmartDive: it is the only quantity a "
+            f"camera cannot measure, and without it a height of "
+            f"{anthro.DEFAULT_STATURE_M:.2f} m is assumed and every distance and "
+            "speed carries roughly 15%% error. Times and angles are unaffected"
+        ),
+    )
+    scale.add_argument(
+        "--capture-fps",
+        type=float,
+        default=None,
+        help="true capture rate, for slow-motion clips the container mislabels",
+    )
+    scale.add_argument(
+        "--no-slow-motion",
+        action="store_true",
+        help="do not try to recover the capture rate from gravity",
+    )
+    scale.add_argument(
+        "--no-depth-scale",
+        action="store_true",
+        help="hold the pixels-per-metre scale constant even if the athlete's size changes",
+    )
 
     out = run.add_argument_group("outputs")
     out.add_argument("--overlay", action="store_true", help="render an annotated video")
@@ -107,6 +151,14 @@ def _config_from_args(args: argparse.Namespace) -> AnalysisConfig:
     if bool(args.reference_px) != bool(args.reference_m):
         raise SystemExit("--reference-px and --reference-m must be given together")
 
+    # Checked here rather than only deep in the calibration, so a units slip is
+    # reported before minutes of inference rather than after.
+    if args.stature_m is not None:
+        try:
+            anthro.check_stature(args.stature_m)
+        except ValueError as error:
+            raise SystemExit(f"--stature-m: {error}") from None
+
     window = None
     if args.flight_window:
         try:
@@ -122,9 +174,14 @@ def _config_from_args(args: argparse.Namespace) -> AnalysisConfig:
         backend=args.backend,
         backend_options=backend_options,
         min_keypoint_conf=args.min_conf,
+        refine=not args.no_refine,
+        stabilise=not args.no_stabilise,
+        depth_scale=not args.no_depth_scale,
+        detect_slow_motion=not args.no_slow_motion,
         reference_px=args.reference_px,
         reference_m=args.reference_m,
         stature_m=args.stature_m,
+        capture_fps=args.capture_fps,
         flight_window=window,
         bootstrap=args.bootstrap,
     )
@@ -136,7 +193,7 @@ def _run_analyze(args: argparse.Namespace) -> int:
     outdir: Path = args.outdir
     outdir.mkdir(parents=True, exist_ok=True)
 
-    result = analyze(args.video, config, progress=args.progress)
+    result = analyze(args.video, config, progress=args.progress, cache=args.cache)
 
     report = write_json(result, outdir / f"{name}.json")
     written = [report]
@@ -154,23 +211,40 @@ def _run_analyze(args: argparse.Namespace) -> int:
         return 0
 
     print(f"\nSmartDive {__version__}  |  {args.video.name}")
+    rate = f"{result.video.fps:g} fps"
+    if result.time_base.corrected:
+        rate += f" container, {result.fps:g} fps capture"
     print(
-        f"{result.video.width}x{result.video.height} @ {result.video.fps:g} fps, "
+        f"{result.video.width}x{result.video.height} @ {rate}, "
         f"{result.video.frame_count} frames  |  analysed in {result.elapsed_s:.1f} s"
     )
     print(
         f"subject: track {result.subject.track_id} of {len(result.tracks)} "
         f"({len(result.subject.observations)} detections, "
-        f"{result.subject_ranking[0].displacement_bodies:.1f} body lengths travelled)"
+        f"{result.subject_ranking[0].displacement_bodies:.1f} body lengths travelled, "
+        f"peak {result.subject_ranking[0].peak_speed_bodies_s:.1f} body lengths/s)"
     )
 
     quality = result.quality()
     print(
         f"signal: {quality['coverage']:.0%} coverage, "
         f"jitter {quality['jitter_raw_px']:.1f} -> {quality['jitter_conditioned_px']:.1f} px, "
-        f"{int(quality['outliers_rejected'])} spikes rejected, "
-        f"{int(quality['gaps_filled'])} frames interpolated"
+        f"{int(quality['gaps_filled'])} frames interpolated, "
+        f"camera drift {quality['camera_drift_px']:.0f} px removed"
     )
+    if result.refinement is not None:
+        r = result.refinement
+        print(
+            f"refine: {r.frames_recovered} frames recovered, "
+            f"{r.frames_improved} improved, {r.frames_unchanged} unchanged"
+        )
+    if result.calibration is not None:
+        print(f"scale:  {result.calibration.px_per_metre:.1f} px/m, {result.calibration.note}")
+    else:
+        print(
+            f"scale:  {result.body.stature_px:.0f} px of stature from "
+            f"{len(result.body.per_segment)} segments (spread {result.body.dispersion:.0%})"
+        )
 
     if result.metrics is None:
         print("\nNo ballistic flight phase was found in this clip.")

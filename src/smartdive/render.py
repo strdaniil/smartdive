@@ -1,10 +1,26 @@
 """Overlay rendering.
 
-Two things changed from the original overlay scripts. The trail is drawn with a
-single ``polylines`` call per frame instead of re-drawing every past segment
-individually, which turns an O(n^2) render into an O(n) one. And the overlay
-shows the *model* next to the measurement, plus a live metric panel, so the
-video is evidence rather than decoration.
+The overlay's job is to make the measurement checkable by eye. Three things it
+draws are worth calling out.
+
+**Everything is drawn back in the camera's frame.** The pipeline works in a
+stabilised coordinate system in which the camera never moved (see
+:mod:`smartdive.camera`), and a trajectory drawn from those coordinates straight
+onto the original video would drift away from the athlete by however far the
+camera panned. Every point is therefore mapped back through the per-frame warp
+before it is drawn, so the trail sits on the body it describes.
+
+**The model is drawn next to the measurement.** The green trail is what was
+measured and the amber curve is the projectile the physics fitted. Where they
+agree, the model explains the motion and the numbers mean something; where they
+part company, they do not. That comparison is the whole point of the picture and
+it is not available from a single line drawn on a video.
+
+**Joint trails are optional and secondary.** Tracing the hips, shoulders and
+head is what the original project drew, and it is genuinely useful for looking
+at body rotation through the flight, but it is not what the metrics are
+computed from, so it is drawn thin and behind the centre-of-mass trail rather
+than in place of it.
 """
 
 from __future__ import annotations
@@ -15,7 +31,7 @@ import cv2
 import numpy as np
 
 from smartdive.analysis import DiveAnalysis
-from smartdive.keypoints import SKELETON
+from smartdive.keypoints import NAME_TO_INDEX, PAIR_LANDMARKS, SKELETON
 from smartdive.video import VideoWriter
 from smartdive.video import frames as iter_frames
 
@@ -28,6 +44,20 @@ COLOR_PANEL = (28, 24, 20)
 COLOR_TEXT = (240, 240, 240)
 COLOR_DIM = (176, 176, 176)
 COLOR_FLAG = (90, 120, 255)
+
+#: Joints traced alongside the centre of mass, and the colour of each trail.
+JOINT_TRAILS: tuple[tuple[str, tuple[int, int, int]], ...] = (
+    ("hips", (210, 130, 90)),
+    ("shoulders", (200, 100, 200)),
+    ("nose", (90, 190, 230)),
+)
+
+
+def _to_image(analysis: DiveAnalysis, index: int, points: np.ndarray) -> np.ndarray:
+    """Map stabilised points back into frame ``index``'s own coordinates."""
+    if not analysis.config.stabilise or not len(analysis.motion):
+        return np.asarray(points, dtype=float)
+    return analysis.motion.unstabilise(index, points)
 
 
 def _draw_skeleton(
@@ -57,6 +87,129 @@ def _draw_skeleton(
                 -1,
                 cv2.LINE_AA,
             )
+
+
+def _polyline(frame: np.ndarray, points: np.ndarray, colour, thickness: int) -> None:
+    """Draw a trail, breaking it wherever the trajectory has a gap."""
+    good = ~np.isnan(points[:, 0])
+    if not good.any():
+        return
+    idx = np.where(good)[0]
+    breaks = np.where(np.diff(idx) > 1)[0] + 1
+    for run in np.split(idx, breaks):
+        if len(run) > 1:
+            cv2.polylines(
+                frame,
+                [np.round(points[run]).astype(np.int32)],
+                False,
+                colour,
+                thickness,
+                cv2.LINE_AA,
+            )
+
+
+def _joint_series(analysis: DiveAnalysis, name: str) -> np.ndarray:
+    """``(N, 2)`` conditioned trajectory of a named joint, in stabilised space."""
+    pose = analysis.pose
+    present = pose.present()
+    if name in PAIR_LANDMARKS:
+        i, j = PAIR_LANDMARKS[name]
+        out = (pose.xy[:, i, :] + pose.xy[:, j, :]) / 2.0
+        out[~(present[:, i] & present[:, j])] = np.nan
+        return out
+    k = NAME_TO_INDEX[name]
+    out = pose.xy[:, k, :].copy()
+    out[~present[:, k]] = np.nan
+    return out
+
+
+def render_overlay(
+    analysis: DiveAnalysis,
+    output: str | Path,
+    show_skeleton: bool = True,
+    show_model: bool = True,
+    show_panel: bool = True,
+    show_joint_trails: bool = True,
+    trail_length: int | None = None,
+) -> Path:
+    """Write an annotated copy of the source video."""
+    info = analysis.video
+    scale = max(0.6, min(info.width, info.height) / 720.0)
+    thickness = max(2, round(2 * scale))
+
+    traj = analysis.trajectory
+    fit = analysis.fit
+    min_conf = analysis.config.min_keypoint_conf
+
+    trails = (
+        [(name, colour, _joint_series(analysis, name)) for name, colour in JOINT_TRAILS]
+        if show_joint_trails
+        else []
+    )
+
+    model_points = None
+    if show_model and fit is not None:
+        model_points = fit.sample(180)
+
+    output = Path(output)
+    with VideoWriter(output, info.fps, (info.width, info.height)) as writer:
+        for index, frame in iter_frames(info.path):
+            det = analysis.subject.observations.get(index)
+            if show_skeleton and det is not None:
+                _draw_skeleton(
+                    frame, _to_image(analysis, index, det.xy), det.conf, min_conf, thickness
+                )
+
+            lo = 0 if not trail_length else max(0, index + 1 - trail_length)
+            for _name, colour, series in trails:
+                _polyline(
+                    frame,
+                    _to_image(analysis, index, series[lo : index + 1]),
+                    colour,
+                    max(1, thickness - 1),
+                )
+
+            upto = _to_image(analysis, index, traj.xy[lo : index + 1])
+            _polyline(frame, upto, COLOR_MEASURED, thickness)
+            head = upto[~np.isnan(upto[:, 0])]
+            if len(head):
+                cv2.circle(
+                    frame,
+                    tuple(np.round(head[-1]).astype(int)),
+                    thickness + 3,
+                    COLOR_MEASURED,
+                    -1,
+                    cv2.LINE_AA,
+                )
+
+            if model_points is not None and fit is not None and index >= fit.start_frame:
+                progress = min(
+                    1.0,
+                    (index - fit.start_frame) / max(fit.end_frame - fit.start_frame, 1),
+                )
+                end = max(2, int(progress * len(model_points)))
+                drawn = _to_image(analysis, index, model_points[:end])
+                cv2.polylines(
+                    frame,
+                    [np.round(drawn).astype(np.int32)],
+                    False,
+                    COLOR_MODEL,
+                    thickness,
+                    cv2.LINE_AA,
+                )
+
+            if fit is not None:
+                if index == fit.start_frame:
+                    _flag(frame, "TAKEOFF", scale)
+                elif index == fit.end_frame:
+                    _flag(frame, "ENTRY", scale)
+
+            if show_panel:
+                _panel(frame, _panel_lines(analysis, index), _phase(analysis, index), scale)
+
+            writer.write(frame)
+
+    return output
 
 
 def _panel(
@@ -106,73 +259,6 @@ def _panel(
         )
 
 
-def render_overlay(
-    analysis: DiveAnalysis,
-    output: str | Path,
-    show_skeleton: bool = True,
-    show_model: bool = True,
-    show_panel: bool = True,
-    trail_length: int | None = None,
-) -> Path:
-    """Write an annotated copy of the source video.
-
-    The green trail is what was measured; the amber curve is the fitted
-    projectile. Where they agree, the physics model explains the motion.
-    """
-    info = analysis.video
-    scale = max(0.6, min(info.width, info.height) / 720.0)
-    thickness = max(2, round(2 * scale))
-
-    traj = analysis.trajectory
-    fit = analysis.fit
-    min_conf = analysis.config.min_keypoint_conf
-
-    model_points = None
-    if show_model and fit is not None:
-        model_points = np.round(fit.sample(180)).astype(np.int32)
-
-    output = Path(output)
-    with VideoWriter(output, info.fps, (info.width, info.height)) as writer:
-        for index, frame in iter_frames(info.path):
-            det = analysis.subject.observations.get(index)
-            if show_skeleton and det is not None:
-                _draw_skeleton(frame, det.xy, det.conf, min_conf, thickness)
-
-            # Measured trail up to now, as one polyline per contiguous run.
-            upto = traj.xy[: index + 1]
-            if trail_length:
-                upto = traj.xy[max(0, index + 1 - trail_length) : index + 1]
-            good = ~np.isnan(upto[:, 0])
-            if good.any():
-                pts = np.round(upto[good]).astype(np.int32)
-                if len(pts) > 1:
-                    cv2.polylines(frame, [pts], False, COLOR_MEASURED, thickness, cv2.LINE_AA)
-                cv2.circle(frame, tuple(pts[-1]), thickness + 3, COLOR_MEASURED, -1, cv2.LINE_AA)
-
-            if model_points is not None and fit is not None and index >= fit.start_frame:
-                progress = min(
-                    1.0,
-                    (index - fit.start_frame) / max(fit.end_frame - fit.start_frame, 1),
-                )
-                end = max(2, int(progress * len(model_points)))
-                cv2.polylines(
-                    frame, [model_points[:end]], False, COLOR_MODEL, thickness, cv2.LINE_AA
-                )
-
-            if fit is not None:
-                if index == fit.start_frame:
-                    _flag(frame, "TAKEOFF", scale)
-                elif index == fit.end_frame:
-                    _flag(frame, "ENTRY", scale)
-
-            if show_panel:
-                _panel(frame, _panel_lines(analysis, index), _phase(analysis, index), scale)
-
-            writer.write(frame)
-
-    return output
-
-
 def _flag(frame: np.ndarray, text: str, scale: float) -> None:
     h, w = frame.shape[:2]
     font = cv2.FONT_HERSHEY_SIMPLEX
@@ -213,7 +299,7 @@ def _panel_lines(analysis: DiveAnalysis, index: int) -> list[tuple[str, str]]:
     if index < fit.start_frame:
         lines.append(("phase", f"takeoff at frame {fit.start_frame}"))
     elif index <= fit.end_frame:
-        t = (index - fit.start_frame) / analysis.video.fps
+        t = (index - fit.start_frame) / analysis.fps
         pos = fit.position(np.array([t]))[0]
         drop = (pos[1] - fit.y0) / metrics.px_per_metre
         lines += [
@@ -231,6 +317,8 @@ def _panel_lines(analysis: DiveAnalysis, index: int) -> list[tuple[str, str]]:
         ("scale", f"{metrics.px_per_metre:.0f} px/m ({metrics.calibration_method})"),
         ("fit R^2", f"{metrics.fit_r_squared:.4f}"),
     ]
+    if analysis.time_base.corrected:
+        lines.insert(1, ("capture rate", f"{analysis.fps:g} fps"))
     return lines
 
 
